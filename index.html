@@ -898,7 +898,7 @@ window.doLogin = async function(){
 
 window.doRegister = async function(){
   const name=document.getElementById('reg-name').value.trim();
-  const email=document.getElementById('reg-email').value.trim();
+  const email=document.getElementById('reg-email').value.trim().toLowerCase();
   const pass=document.getElementById('reg-pass').value;
   const btn=document.querySelector('#register-form .auth-btn');
   const err=document.getElementById('auth-err');
@@ -907,33 +907,57 @@ window.doRegister = async function(){
 
   btn.disabled=true;btn.textContent='جاري الإنشاء...';
   try{
-    // Check if email was invited
-    const invRef=doc(db,'invitations',email.toLowerCase());
+    // ADMIN WHITELIST — these emails are always admin regardless
+    const ADMIN_EMAILS=['alddany1988@gmail.com'];
+    const isAdminEmail=ADMIN_EMAILS.includes(email);
+
+    // Check invitation (do this before creating account)
+    const invRef=doc(db,'invitations',email);
     const invSnap=await getDoc(invRef);
 
-    // Check if this is first user (becomes admin automatically)
-    const usersSnap=await getDocs(collection(db,'users'));
-    const isFirstUser=usersSnap.empty;
+    // Check bootstrap (first-ever user)
+    const bootstrapRef=doc(db,'_meta','bootstrap');
+    const bootstrapSnap=await getDoc(bootstrapRef);
+    const isFirstEver=!bootstrapSnap.exists();
 
-    if(!isFirstUser&&!invSnap.exists()){
+    // Decide if allowed
+    const allowed=isAdminEmail||isFirstEver||invSnap.exists();
+    if(!allowed){
       err.textContent='هذا البريد غير مدعو. يرجى التواصل مع المدير للحصول على دعوة.';
       err.classList.add('show');
       btn.disabled=false;btn.textContent='إنشاء الحساب';
       return;
     }
 
+    // Create auth account
     const cred=await createUserWithEmailAndPassword(auth,email,pass);
     await updateProfile(cred.user,{displayName:name});
-    const role=isFirstUser?'admin':(invSnap.data()?.role||'viewer');
+
+    // Determine role
+    const role=isAdminEmail||isFirstEver?'admin':(invSnap.data()?.role||'viewer');
+
+    // Mark bootstrap
+    if(isFirstEver||isAdminEmail){
+      await setDoc(bootstrapRef,{createdAt:serverTimestamp(),adminUid:cred.user.uid});
+    }
+
+    // Save user profile
     await setDoc(doc(db,'users',cred.user.uid),{
       name,email,role,
       createdAt:serverTimestamp(),
       uid:cred.user.uid
     });
+
+    // Remove invitation if used
     if(invSnap.exists()) await deleteDoc(invRef);
+
   }catch(e){
-    const msgs={'auth/email-already-in-use':'هذا البريد مسجل مسبقاً'};
-    err.textContent=msgs[e.code]||'خطأ في إنشاء الحساب: '+e.message;
+    const msgs={
+      'auth/email-already-in-use':'هذا البريد مسجل مسبقاً — انقر "تسجيل الدخول"',
+      'auth/weak-password':'كلمة المرور ضعيفة جداً، استخدم 8 أحرف على الأقل',
+      'auth/invalid-email':'البريد الإلكتروني غير صحيح'
+    };
+    err.textContent=msgs[e.code]||'خطأ: '+e.message;
     err.classList.add('show');
     btn.disabled=false;btn.textContent='إنشاء الحساب';
   }
@@ -945,47 +969,77 @@ window.doLogout = async function(){
 };
 
 /* ══════════ AUTH STATE ══════════ */
-onAuthStateChanged(auth, async (user)=>{
-  if(user){
-    currentUser=user;
-    // Load user role
-    const userDoc=await getDoc(doc(db,'users',user.uid));
+const ADMIN_EMAILS_LIST=['alddany1988@gmail.com'];
+
+async function getDocWithTimeout(ref, ms=8000){
+  return Promise.race([
+    getDoc(ref),
+    new Promise((_,reject)=>setTimeout(()=>reject(new Error('timeout')),ms))
+  ]);
+}
+
+async function initUserSession(user){
+  currentUser=user;
+  const uname=user.displayName||user.email.split('@')[0];
+  const isAdminByEmail=ADMIN_EMAILS_LIST.includes(user.email.toLowerCase());
+
+  try{
+    const userDoc=await getDocWithTimeout(doc(db,'users',user.uid));
     if(userDoc.exists()){
-      userRole=userDoc.data().role;
-      const uname=userDoc.data().name||user.displayName||user.email.split('@')[0];
-      document.getElementById('user-avatar').textContent=uname.charAt(0).toUpperCase();
-      document.getElementById('user-name-hdr').textContent=uname;
-      const roleLabels={admin:'مدير',editor:'محرر',viewer:'مشاهد'};
-      document.getElementById('user-role-hdr').textContent=roleLabels[userRole]||userRole;
-      if(isAdmin()){
-        document.getElementById('adminTabBtn').style.display='';
+      userRole=userDoc.data().role||'viewer';
+      // Force admin role if in whitelist
+      if(isAdminByEmail&&userRole!=='admin'){
+        userRole='admin';
+        await setDoc(doc(db,'users',user.uid),{...userDoc.data(),role:'admin'});
       }
     } else {
-      // User exists in auth but not in Firestore — create basic record
-      userRole='viewer';
+      // Not in Firestore yet — create record
+      userRole=isAdminByEmail?'admin':'viewer';
       await setDoc(doc(db,'users',user.uid),{
-        name:user.displayName||user.email.split('@')[0],
-        email:user.email,role:'viewer',
+        name:uname,email:user.email,
+        role:userRole,
         createdAt:serverTimestamp(),uid:user.uid
       });
     }
-    // Hide auth, show app
-    document.getElementById('auth-screen').classList.add('hidden');
-    document.getElementById('loading-screen').classList.add('hidden');
-    document.getElementById('app').style.display='block';
-    // Apply role restrictions
-    applyRoleUI();
-    // Load initial data
-    await loadWeekData(CW);
+  } catch(e){
+    // Firestore failed or timed out — use email whitelist as fallback
+    console.warn('Firestore user load failed, using fallback:',e.message);
+    userRole=isAdminByEmail?'admin':'viewer';
+  }
+
+  // Update header UI
+  document.getElementById('user-avatar').textContent=uname.charAt(0).toUpperCase();
+  document.getElementById('user-name-hdr').textContent=uname;
+  const roleLabels={admin:'مدير',editor:'محرر',viewer:'مشاهد'};
+  document.getElementById('user-role-hdr').textContent=roleLabels[userRole]||userRole;
+  if(userRole==='admin') document.getElementById('adminTabBtn').style.display='';
+
+  // Show app
+  document.getElementById('auth-screen').classList.add('hidden');
+  document.getElementById('loading-screen').classList.add('hidden');
+  document.getElementById('app').style.display='block';
+
+  applyRoleUI();
+
+  // Load data (non-blocking)
+  loadWeekData(CW).then(()=>{
     renderTasks();
     renderExtraTasks();
-    renderCalendar();
-    renderPlanLegend();
+  }).catch(console.error);
+  renderCalendar();
+  renderPlanLegend();
+}
+
+onAuthStateChanged(auth, async (user)=>{
+  if(user){
+    await initUserSession(user);
   } else {
-    // Show auth
     document.getElementById('loading-screen').classList.add('hidden');
     document.getElementById('auth-screen').style.opacity='1';
     document.getElementById('auth-screen').style.pointerEvents='auto';
+    // Reset login button if stuck
+    const btn=document.querySelector('#login-form .auth-btn');
+    if(btn){btn.disabled=false;btn.textContent='دخول';}
   }
 });
 
